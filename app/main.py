@@ -13,12 +13,13 @@ from .errors import ApiError
 from .evaluator import Evaluator, Label, Table
 from .provenance import (
     build_symbol_table,
+    label_sort_key,
     label_to_string,
+    minimal_deletion_sets_by_recompute,
     minimal_hitting_sets,
     present_row,
 )
 from .store import IdempotencyStore
-from .values import value_sort_key
 
 DB_PATH = os.environ.get("PROVENANCE_DB", "/data/provenance.db")
 
@@ -175,6 +176,46 @@ def recompute_after_deletion(
     return cols, rows
 
 
+def kills_target(
+    plan: dict, tables: dict[str, Table], target_data: tuple, deleted: frozenset[Label]
+) -> bool:
+    """True when recomputing without *deleted* removes the full target row.
+
+    A recompute error (e.g. EMPTY_AGGREGATE after the last row of a group is
+    deleted) counts as the target being gone.
+    """
+    try:
+        _, rrows = recompute_after_deletion(plan, tables, deleted)
+    except ApiError:
+        return True
+    return not any(rr["data"] == target_data for rr in rrows)
+
+
+def deletion_sets_for_target(
+    payload: QueryIn, tables: dict[str, Table], ev: Evaluator, target_raw: dict
+) -> list[frozenset[Label]]:
+    """All inclusion-minimal source-row deletions removing the target row.
+
+    For monotone plans (and monotone aggregates: count/min/max, sums over
+    same-sign values) these are exactly the minimal hitting sets of the
+    target's minimal witnesses. A sum over mixed positive/negative values is
+    non-monotone — deleting a row outside every witness can still change the
+    total — so its deletion sets are decided by recomputing the plan over
+    the group's source rows; if that search is inapplicable or too large,
+    the hitting-set answer is kept.
+    """
+    deletions = minimal_hitting_sets(target_raw["witnesses"])
+    pool = ev.mixed_sign_sum_pool(payload.plan, target_raw["data"])
+    if pool is not None:
+        found = minimal_deletion_sets_by_recompute(
+            pool,
+            lambda d: kills_target(payload.plan, tables, target_raw["data"], d),
+        )
+        if found is not None:
+            deletions = found
+    return deletions
+
+
 def execute_query(payload: QueryIn) -> dict[str, Any]:
     tables = load_tables(payload)
     ev = Evaluator(tables)
@@ -206,11 +247,11 @@ def execute_query(payload: QueryIn) -> dict[str, Any]:
         target_idx = resolve_target(payload.explain, presented, columns)
         target_raw = rows[target_idx]
         target_presented = presented[target_idx]
-        deletions = minimal_hitting_sets(target_raw["witnesses"])
+        deletions = deletion_sets_for_target(payload, tables, ev, target_raw)
 
         scenarios = []
         for h in deletions:
-            deleted_sorted = sorted(h, key=lambda l: (l[0], tuple(value_sort_key(p) for p in l[1])))
+            deleted_sorted = sorted(h, key=label_sort_key)
             try:
                 rc, rrows = recompute_after_deletion(payload.plan, tables, h)
                 target_present = any(rr["data"] == target_raw["data"] for rr in rrows)
@@ -247,7 +288,7 @@ def execute_query(payload: QueryIn) -> dict[str, Any]:
             "target_provenance": target_presented["provenance"],
             "minimal_deletion_count": len(deletions),
             "minimal_deletion_sets": [
-                [label_to_string(l) for l in sorted(h, key=lambda l: (l[0], tuple(value_sort_key(p) for p in l[1])))]
+                [label_to_string(l) for l in sorted(h, key=label_sort_key)]
                 for h in deletions
             ],
             "scenarios": scenarios,

@@ -171,13 +171,18 @@ def cover_witnesses(rows: Iterable[dict]) -> set[Witness]:
 def minimal_sum_combos(
     items: list[tuple[dict, Any]], target: Any
 ) -> list[tuple[dict, ...]]:
-    """All inclusion-minimal subsets of *items* whose values sum to *target*.
+    """All inclusion-minimal NON-EMPTY subsets of *items* summing to *target*.
 
     Rows are matched by identity, so equal-valued rows yield distinct
-    combinations. Once a partial selection already sums to the target no
-    superset of it can be minimal, and with all values non-negative a partial
-    sum above the target can never come back down; both observations prune
-    the backtracking.
+    combinations. The empty selection is never a combination: a sum over zero
+    source rows is not produced by any source row. This matters when the
+    target is 0 — with mixed positive/negative values the empty set would
+    otherwise "witness" the total and collapse the sum component to the
+    trivial family, making the provenance (and the deletion sets derived
+    from it) wrong. Once a partial selection already sums to the target no
+    superset of it can be minimal, and with all values non-negative a
+    partial sum above the target can never come back down; both observations
+    prune the backtracking.
     """
     n = len(items)
     non_negative = all(is_number(v) and v >= 0 for _, v in items)
@@ -187,7 +192,7 @@ def minimal_sum_combos(
     stack: list[tuple[int, Any, tuple[int, ...]]] = [(0, 0, ())]
     while stack:
         i, acc, chosen = stack.pop()
-        if acc == target:
+        if acc == target and chosen:
             combos.append(tuple(items[j][0] for j in chosen))
             continue
         if i == n or (non_negative and acc > target):
@@ -552,6 +557,82 @@ class Evaluator:
 
     _AGG_FNS = {"count", "sum", "min", "max"}
 
+    # Sentinel for the project walk in mixed_sign_sum_pool: marks input
+    # columns the projection did not carry through.
+    _UNMAPPED = object()
+
+    def mixed_sign_sum_pool(self, node: Any, target_data: tuple) -> set[Label] | None:
+        """Source labels feeding the target row's group, when that group has
+        a ``sum`` over mixed positive/negative values (a non-monotone sum).
+
+        *node* is the plan root and *target_data* the target row aligned to
+        its output schema. The walk descends through ``filter``/``project``
+        nodes (which neither change row identity nor dependencies) to the
+        innermost ``aggregate`` producing the target. Returns ``None`` when:
+
+        * no ``sum`` aggregate is involved (count/min/max are exact through
+          hitting sets), or
+        * the target group's values are all non-negative or all non-positive
+          (the sum then changes iff a minimal-combination row is deleted, so
+          hitting sets stay exact), or
+        * the aggregate cannot be reached by the walk (e.g. a join above
+          it), in which case the caller keeps the hitting-set answer.
+
+        Otherwise returns every source label appearing in the witnesses of
+        the target group's member rows — the candidate pool for
+        recomputation-based deletion-set search.
+        """
+        data = tuple(target_data)
+        while True:
+            t = node.get("type") if isinstance(node, dict) else None
+            if t == "filter":
+                node = self._input(node)
+            elif t == "project":
+                spec = self._proj_cols(node)
+                out_values = dict(zip([asname for _, asname in spec], data))
+                in_names = self.schema(self._input(node))
+                mapped = {name: self._UNMAPPED for name in in_names}
+                for frm, asname in spec:
+                    mapped[frm] = out_values[asname]
+                data = tuple(mapped[name] for name in in_names)
+                node = self._input(node)
+            elif t == "aggregate":
+                break
+            else:
+                return None
+
+        gb = node.get("group_by", [])
+        aggs = self._agg_spec(node)
+        sum_cols = [col for fn, col, _ in aggs if fn == "sum"]
+        if not sum_cols:
+            return None
+        out_schema = self._agg_schema(node)
+        values = dict(zip(out_schema, data))
+        key = tuple(values[g] for g in gb)
+        if any(v is self._UNMAPPED for v in key):
+            return None
+        in_names = self.schema(self._input(node))
+        gi = [in_names.index(g) for g in gb]
+        members = [
+            r
+            for r in self.eval(self._input(node))
+            if tuple(r["data"][i] for i in gi) == key
+        ]
+        mixed = False
+        for col in sum_cols:
+            ci = in_names.index(col)
+            vals = [r["data"][ci] for r in members if r["data"][ci] is not None]
+            if any(v > 0 for v in vals) and any(v < 0 for v in vals):
+                mixed = True
+                break
+        if not mixed:
+            return None
+        pool: set[Label] = set()
+        for r in members:
+            for w in r["witnesses"]:
+                pool.update(w)
+        return pool
+
     def _agg_spec(self, node: dict):
         aggs = node.get("aggregates", [])
         if not isinstance(aggs, list) or not aggs:
@@ -609,8 +690,8 @@ class Evaluator:
         * ``count(*)`` / ``count(col)`` covers every row participating in the
           count (all members, resp. all members with a non-NULL value): one
           conjunction over those rows;
-        * ``sum(col)`` enumerates the inclusion-minimal row combinations
-          whose values add up to the target sum;
+        * ``sum(col)`` enumerates the inclusion-minimal NON-EMPTY row
+          combinations whose values add up to the target sum;
         * ``min(col)`` / ``max(col)`` enumerates the inclusion-minimal
           combinations still yielding the extremum — one per member row equal
           to it (equal-valued rows give distinct combinations).

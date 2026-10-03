@@ -363,14 +363,123 @@ def test_aggregate_sum_equal_value_combos(client):
     assert row["provenance"]["dnf"] == "(s1 ∧ s2) ∨ (s3)"
     assert row["provenance"]["dnf_structured"] == [["s1", "s2"], ["s3"]]
     cf = body["counterfactual"]
+    # Mixed positive/negative values make the sum non-monotone: deleting ANY
+    # single row changes the total (removing 30 leaves 30, removing 60
+    # leaves 0, removing -60 leaves 120), so every singleton is a minimal
+    # deletion set — decided by recomputation, not by hitting sets.
     assert cf["minimal_deletion_sets"] == [
-        ["orders[1]", "orders[3]"],
-        ["orders[2]", "orders[3]"],
+        ["orders[1]"],
+        ["orders[2]"],
+        ["orders[3]"],
+        ["orders[4]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("orders[1]",)]["result"]["rows"] == [{"total": 30}]
+    assert by_delete[("orders[2]",)]["result"]["rows"] == [{"total": 30}]
+    assert by_delete[("orders[3]",)]["result"]["rows"] == [{"total": 0}]
+    assert by_delete[("orders[4]",)]["result"]["rows"] == [{"total": 120}]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
+
+
+def test_sum_mixed_signs_zero_total(client):
+    """5 and -5 in one group, sum=0: the empty combination is not a witness,
+    and deleting either single row (not both) removes the target."""
+    req = {
+        "idempotency_key": "key-agg-mixed-zero",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "cid", "amount"],
+                "rows": [
+                    {"oid": 1, "cid": 10, "amount": 5},
+                    {"oid": 2, "cid": 10, "amount": -5},
+                    {"oid": 3, "cid": 20, "amount": 7},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "group_by": ["cid"],
+            "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+        },
+        "explain": {"row": {"cid": 10, "total": 0}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    target = next(x for x in body["result"]["rows"] if x["row"]["cid"] == 10)
+    # The zero total is witnessed by the non-empty pair, not the empty set.
+    assert target["provenance"]["dnf"] == "(s1 ∧ s2)"
+    assert target["minimal_witnesses"][0]["labels"] == ["orders[1]", "orders[2]"]
+    # The other group keeps its own single-row witness.
+    other = next(x for x in body["result"]["rows"] if x["row"]["cid"] == 20)
+    assert other["provenance"]["dnf"] == "(s3)"
+    cf = body["counterfactual"]
+    # Recomputation shows deleting either single row changes the total to
+    # ±5, so the minimal deletion sets are the two singletons — not the
+    # two-row set the (buggy) empty-witness hitting sets reported.
+    assert cf["minimal_deletion_sets"] == [["orders[1]"], ["orders[2]"]]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("orders[1]",)]["result"]["rows"] == [
+        {"cid": 10, "total": -5},
+        {"cid": 20, "total": 7},
+    ]
+    assert by_delete[("orders[2]",)]["result"]["rows"] == [
+        {"cid": 10, "total": 5},
+        {"cid": 20, "total": 7},
     ]
     for sc in cf["scenarios"]:
         assert sc["target_present"] is False
-        # One 30-row and the -60 row remain: the group total becomes -30.
-        assert sc["result"]["rows"] == [{"total": -30}]
+
+
+def test_sum_mixed_signs_nonmonotone_deletions(client):
+    """5, 2, -2 (sum=5): deleting ANY single row changes the total, so the
+    minimal deletion sets include the rows that appear in no minimal sum
+    combination (the 2 and the -2)."""
+    req = {
+        "idempotency_key": "key-agg-mixed-nonmono",
+        "tables": [
+            {
+                "table": "orders",
+                "primary_key": ["oid"],
+                "columns": ["oid", "amount"],
+                "rows": [
+                    {"oid": 1, "amount": 5},
+                    {"oid": 2, "amount": 2},
+                    {"oid": 3, "amount": -2},
+                ],
+            }
+        ],
+        "plan": {
+            "type": "aggregate",
+            "input": {"type": "scan", "table": "orders"},
+            "aggregates": [{"fn": "sum", "column": "amount", "as": "total"}],
+        },
+        "explain": {"row": {"total": 5}},
+    }
+    r = client.post("/query", json=req)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    row = body["result"]["rows"][0]
+    # Only {orders[1]} sums to 5 minimally: the witness stays a singleton.
+    assert row["provenance"]["dnf"] == "(s1)"
+    cf = body["counterfactual"]
+    # But the sum is non-monotone: removing the 2 or the -2 changes the
+    # total to 3 or 7, so those singletons are minimal deletion sets too.
+    assert cf["minimal_deletion_sets"] == [
+        ["orders[1]"],
+        ["orders[2]"],
+        ["orders[3]"],
+    ]
+    by_delete = {tuple(sc["delete"]): sc for sc in cf["scenarios"]}
+    assert by_delete[("orders[1]",)]["result"]["rows"] == [{"total": 0}]
+    assert by_delete[("orders[2]",)]["result"]["rows"] == [{"total": 3}]
+    assert by_delete[("orders[3]",)]["result"]["rows"] == [{"total": 7}]
+    for sc in cf["scenarios"]:
+        assert sc["target_present"] is False
 
 
 def test_aggregate_min_max_null_counterfactual(client):

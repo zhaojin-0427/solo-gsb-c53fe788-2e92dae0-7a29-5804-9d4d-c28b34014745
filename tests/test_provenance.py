@@ -1,6 +1,6 @@
 """Unit tests for minimal hitting sets and witness construction."""
 from app.evaluator import Evaluator, Table
-from app.provenance import minimal_hitting_sets
+from app.provenance import minimal_deletion_sets_by_recompute, minimal_hitting_sets
 
 
 def L(table, *pk):
@@ -34,6 +34,25 @@ def test_single_witness():
     w = frozenset([L("a", "x"), L("b", "y")])
     hs = minimal_hitting_sets(witnesses={w})
     assert set(hs) == {frozenset([L("a", "x")]), frozenset([L("b", "y")])}
+
+
+def test_deletion_sets_by_recompute():
+    pool = {L("t", 1), L("t", 2)}
+    # Every non-empty set kills: the singletons are the minimal solutions.
+    sols = minimal_deletion_sets_by_recompute(pool, lambda d: len(d) > 0)
+    assert sols == [frozenset([L("t", 1)]), frozenset([L("t", 2)])]
+    # Only pairs kill: the single pair is the unique minimal solution.
+    sols = minimal_deletion_sets_by_recompute(pool, lambda d: len(d) >= 2)
+    assert sols == [frozenset([L("t", 1), L("t", 2)])]
+    # Non-upward-closed kills (only the exact singleton works): supersets of
+    # a solution are skipped, and the solution is still reported.
+    sols = minimal_deletion_sets_by_recompute(
+        pool, lambda d: d == frozenset([L("t", 1)])
+    )
+    assert sols == [frozenset([L("t", 1)])]
+    # Pools beyond the enumeration bound refuse the search.
+    big = {L("t", i) for i in range(13)}
+    assert minimal_deletion_sets_by_recompute(big, lambda d: True) is None
 
 
 def make_evaluator(spec):
@@ -185,6 +204,39 @@ def test_aggregate_sum_minimal_combos():
     items = [({"id": "a"}, 50), ({"id": "b"}, 30), ({"id": "c"}, -10)]
     combos = minimal_sum_combos(items, 70)
     assert {tuple(m["id"] for m in c) for c in combos} == {("a", "b", "c")}
+
+    # Zero target: the empty selection is never a combination — the minimal
+    # witness is the non-empty cancelling pair.
+    items = [({"id": "a"}, 5), ({"id": "b"}, -5)]
+    combos = minimal_sum_combos(items, 0)
+    assert {tuple(m["id"] for m in c) for c in combos} == {("a", "b")}
+
+
+def test_aggregate_sum_zero_total_witness():
+    """A zero total from mixed signs is witnessed by the non-empty pair."""
+    tables = [
+        {
+            "table": "t",
+            "primary_key": ["id"],
+            "columns": ["id", "v"],
+            "rows": [
+                {"id": 1, "v": 5},
+                {"id": 2, "v": -5},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "t"},
+        "aggregates": [{"fn": "sum", "column": "v", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    rows = ev.eval(plan)
+    assert rows[0]["data"] == (0,)
+    # Not the trivial family from the empty combination: both rows pinned.
+    assert rows[0]["witnesses"] == {frozenset([L("t", 1), L("t", 2)])}
+    hs = minimal_hitting_sets(rows[0]["witnesses"])
+    assert hs == [frozenset([L("t", 1)]), frozenset([L("t", 2)])]
 
 
 def test_aggregate_null_components():

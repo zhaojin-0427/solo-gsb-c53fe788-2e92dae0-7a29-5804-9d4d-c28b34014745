@@ -216,8 +216,9 @@ curl -s -X POST http://localhost:8000/query \
 
 * `count(*)` / `count(col)`：覆盖 **所有参与计数的行**（后者忽略 NULL）
   —— 一个合取；
-* `sum(col)`：枚举 **和为目标值的全部极小行组合**（按行而非按值，同值行
-  产生不同组合并完整保留）；
+* `sum(col)`：枚举 **和为目标值的全部极小非空行组合**（按行而非按值，
+  同值行产生不同组合并完整保留；空组合不是见证 —— 零行的和不由任何
+  来源行产生）；
 * `min(col)` / `max(col)`：枚举 **仍能产生目标极值的极小组合** —— 每个
   等于极值的行各成一个见证。
 
@@ -349,9 +350,144 @@ curl -s -X POST http://localhost:8000/query \
 
 多见证（DNF 多析取项）在 `sum`/`min`/`max` 出现多种极小组合时产生。例如
 同组金额为 `30, 30, 60, -60` 时 `sum=60` 的极小组合是 `{30,30}` 与 `{60}`，
-溯源为 `(s1 ∧ s2) ∨ (s3)`，最小删除集为 `["orders[1]","orders[3]"]` 和
-`["orders[2]","orders[3]"]`；`min`/`max` 则对每个等于极值的行各给出一个
-单例见证。
+溯源为 `(s1 ∧ s2) ∨ (s3)`；该组含正负混合值，求和是非单调的 —— 删除
+**任意一行** 都会改变总和（去掉 30 剩 30、去掉 60 剩 0、去掉 -60 剩 120），
+因此最小删除集是四个单例 `["orders[1]"]`、`["orders[2]"]`、`["orders[3]"]`、
+`["orders[4]"]`（由删除后重算判定，见下节）；`min`/`max` 则对每个等于
+极值的行各给出一个单例见证。
+
+### 混合正负金额的 sum（非单调求和）
+
+同组金额一正一负时，`sum` 对删除不是单调的：删掉一行不属于任何极小
+组合的来源行，总和照样会变。此时“令目标行消失的删除集”**不能**由见证
+的命中集刻画（命中集是单调近似，会漏报甚至误报），服务改为对目标组
+的来源行枚举候选删除集，**逐个在删除后的快照上重算整条计划**，以完整
+目标行是否消失为准，返回全部按包含关系极小的方案。
+
+下面的请求里，组 `cid=10` 的两行金额为 `5` 和 `-5`，合计 `total=0`：
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "idempotency_key": "readme-mixed-1",
+  "tables": [
+    {"table": "orders", "primary_key": ["oid"],
+     "columns": [{"name":"oid","type":"int"},{"name":"cid","type":"int"},{"name":"amount","type":"int"}],
+     "rows": [
+       {"oid":1,"cid":10,"amount":5},
+       {"oid":2,"cid":10,"amount":-5},
+       {"oid":3,"cid":20,"amount":7}
+     ]}
+  ],
+  "plan": {
+    "type": "aggregate",
+    "input": {"type":"scan","table":"orders"},
+    "group_by": ["cid"],
+    "aggregates": [{"fn":"sum","column":"amount","as":"total"}]
+  },
+  "explain": {"row": {"cid":10,"total":0}}
+}'
+```
+
+实际响应（线上传输为单行紧凑 JSON；这里为可读性格式化）：
+
+```json
+{
+  "status": "ok",
+  "symbol_table": [
+    {"symbol": "s1", "source": "orders[1]"},
+    {"symbol": "s2", "source": "orders[2]"},
+    {"symbol": "s3", "source": "orders[3]"}
+  ],
+  "result": {
+    "columns": ["cid", "total"],
+    "row_count": 2,
+    "rows": [
+      {
+        "row": {"cid": 10, "total": 0},
+        "witness_count": 1,
+        "minimal_witnesses": [
+          {
+            "labels": ["orders[1]", "orders[2]"],
+            "symbols": ["s1", "s2"],
+            "conjunction": "s1 ∧ s2"
+          }
+        ],
+        "provenance": {
+          "dnf": "(s1 ∧ s2)",
+          "dnf_structured": [["s1", "s2"]],
+          "labels_structured": [["orders[1]", "orders[2]"]]
+        }
+      },
+      {
+        "row": {"cid": 20, "total": 7},
+        "witness_count": 1,
+        "minimal_witnesses": [
+          {"labels": ["orders[3]"], "symbols": ["s3"], "conjunction": "s3"}
+        ],
+        "provenance": {
+          "dnf": "(s3)",
+          "dnf_structured": [["s3"]],
+          "labels_structured": [["orders[3]"]]
+        }
+      }
+    ]
+  },
+  "counterfactual": {
+    "target_index": 0,
+    "target": {"cid": 10, "total": 0},
+    "target_provenance": {
+      "dnf": "(s1 ∧ s2)",
+      "dnf_structured": [["s1", "s2"]],
+      "labels_structured": [["orders[1]", "orders[2]"]]
+    },
+    "minimal_deletion_count": 2,
+    "minimal_deletion_sets": [
+      ["orders[1]"],
+      ["orders[2]"]
+    ],
+    "scenarios": [
+      {
+        "delete": ["orders[1]"],
+        "target_present": false,
+        "result": {
+          "columns": ["cid", "total"],
+          "row_count": 2,
+          "rows": [
+            {"cid": 10, "total": -5},
+            {"cid": 20, "total": 7}
+          ]
+        }
+      },
+      {
+        "delete": ["orders[2]"],
+        "target_present": false,
+        "result": {
+          "columns": ["cid", "total"],
+          "row_count": 2,
+          "rows": [
+            {"cid": 10, "total": 5},
+            {"cid": 20, "total": 7}
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+解读：`total=0` 的唯一极小见证是非空组合 `orders[1] ∧ orders[2]`（空
+组合不会被当作见证，否则溯源会退化成“组存在即可”）。令目标消失的
+最小删除集是两个单例：删 `orders[1]` 总和变 `-5`，删 `orders[2]` 总和
+变 `5` —— 与删除后重算逐一吻合；另一组 `cid=20` 不受影响。
+
+再如单组金额为 `5, 2, -2`、`sum=5` 时，唯一极小组合是 `{5}`（溯源
+`(s1)`），但删 `2` 总和变 `3`、删 `-2` 总和变 `7`，所以最小删除集是
+三个单例 `["orders[1]"]`、`["orders[2]"]`、`["orders[3]"]` —— 包括不
+出现在任何极小组合中的行。注意非单调求和的删除集不具备向上封闭性：
+上例中删除 `{2,-2}` 两行反而让总和回到 `5`，目标行重新出现；每个返回
+的方案都经过重算验证且按包含关系极小。
 
 ### 幂等重放逐字节一致
 
@@ -397,8 +533,13 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
   同一标签集合只保留一份，输出按标签全序稳定排序。
 * 选择、等值连接、投影对源行单调；聚合输出的见证把“组存在性”（至少一名
   成员存活）与每个聚合表达式的数值组件合取：`count` 覆盖所有参与计数的行，
-  `sum`/`min`/`max` 枚举产生目标值的极小行组合。因此“令输出消失的最小
+  `sum`/`min`/`max` 枚举产生目标值的极小非空行组合。因此“令输出消失的最小
   删除集”等于该输出全部极小见证的 **极小命中集**（hypergraph transversal）：
-  命中所有见证后，组键或某个聚合值必然改变（对 `sum` 含正负混合值的极端
-  情形，命中集是单调近似；每个删除场景都会 **重算整条计划** 并显式给出
-  `target_present`，以重算结果为准）。
+  命中所有见证后，组键或某个聚合值必然改变。
+* 例外是 **含正负混合值的 `sum`**（非单调求和）：删除不属于任何极小组合的
+  行也可能改变总和，且删除更多行可能让目标值重新出现，命中集刻画不再成立。
+  此时服务对目标组的来源行枚举候选删除集，**按删除后重算的完整目标行**
+  判定，返回全部按包含关系极小的方案（候选池超过 12 行时回退为命中集
+  近似）。无论走哪条路径，每个删除场景都会 **重算整条计划** 并显式给出
+  `target_present`，以重算结果为准；删除后聚合输入为空时，场景返回结构化
+  的 `recompute_error`（如 `EMPTY_AGGREGATE`）。
