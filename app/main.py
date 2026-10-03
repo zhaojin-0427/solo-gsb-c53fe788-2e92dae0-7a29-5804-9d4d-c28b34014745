@@ -9,6 +9,11 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field, ConfigDict, ValidationError
 
 from . import canonical
+from .counterfactual import (
+    enumerate_minimal_deletions,
+    evaluate_deletion,
+    trace_target,
+)
 from .errors import ApiError
 from .evaluator import Evaluator, Label, Table
 from .provenance import (
@@ -158,21 +163,39 @@ def resolve_target(explain: ExplainIn | None, presented: list[dict], columns: li
     return matches[0]
 
 
-def recompute_after_deletion(
-    plan: dict, tables: dict[str, Table], deleted: frozenset[Label]
-) -> tuple[list[str], list[dict]]:
-    """Filter the submitted tables by label and rerun the full plan."""
-    deleted_by_table: dict[str, set[tuple]] = {}
-    for lab in deleted:
-        deleted_by_table.setdefault(lab[0], set()).add(lab[1])
-    filtered = {
-        name: t.filtered_copy(deleted_by_table.get(name, set()))
-        for name, t in tables.items()
+def _sorted_labels(deleted: frozenset[Label]) -> list[Label]:
+    return sorted(
+        deleted, key=lambda l: (l[0], tuple(value_sort_key(p) for p in l[1]))
+    )
+
+
+def _scenario(deleted: frozenset[Label], outcome: dict) -> dict:
+    """Build one counterfactual scenario from a recomputation outcome."""
+    labels = [label_to_string(l) for l in _sorted_labels(deleted)]
+    if outcome["kind"] == "error":
+        # Deleting rows may make an aggregate input empty: keep the existing
+        # structured recompute error instead of fabricating an empty result.
+        return {
+            "delete": labels,
+            "target_present": False,
+            "recompute_error": {
+                "code": outcome["code"],
+                "message": outcome["message"],
+            },
+        }
+    recomputed = [
+        {c: v for c, v in zip(outcome["columns"], rr["data"])}
+        for rr in outcome["rows"]
+    ]
+    return {
+        "delete": labels,
+        "target_present": outcome["target_present"],
+        "result": {
+            "columns": outcome["columns"],
+            "row_count": len(recomputed),
+            "rows": recomputed,
+        },
     }
-    ev = Evaluator(filtered)
-    rows = ev.eval(plan)
-    cols = ev.schema(plan)
-    return cols, rows
 
 
 def execute_query(payload: QueryIn) -> dict[str, Any]:
@@ -206,40 +229,30 @@ def execute_query(payload: QueryIn) -> dict[str, Any]:
         target_idx = resolve_target(payload.explain, presented, columns)
         target_raw = rows[target_idx]
         target_presented = presented[target_idx]
-        deletions = minimal_hitting_sets(target_raw["witnesses"])
 
-        scenarios = []
-        for h in deletions:
-            deleted_sorted = sorted(h, key=lambda l: (l[0], tuple(value_sort_key(p) for p in l[1])))
-            try:
-                rc, rrows = recompute_after_deletion(payload.plan, tables, h)
-                target_present = any(rr["data"] == target_raw["data"] for rr in rrows)
-                recomputed = [
-                    {c: v for c, v in zip(rc, rr["data"])} for rr in rrows
-                ]
-                scenarios.append(
-                    {
-                        "delete": [label_to_string(l) for l in deleted_sorted],
-                        "target_present": target_present,
-                        "result": {
-                            "columns": rc,
-                            "row_count": len(recomputed),
-                            "rows": recomputed,
-                        },
-                    }
+        # Trace the target backwards through the plan. When a sum aggregate
+        # mixes positive and negative values in the target group, witness
+        # hitting sets are only a monotone approximation; decide deletion
+        # sets by full recomputation instead, so every inclusion-minimal
+        # killer is found (including singletons the witnesses miss).
+        universe, sum_non_monotone = trace_target(
+            ev, payload.plan, target_raw["data"]
+        )
+        if sum_non_monotone:
+            found = enumerate_minimal_deletions(
+                payload.plan, tables, universe, target_raw["data"]
+            )
+            deletions = [h for h, _ in found]
+            scenarios = [_scenario(h, outcome) for h, outcome in found]
+        else:
+            deletions = minimal_hitting_sets(target_raw["witnesses"])
+            scenarios = []
+            for h in deletions:
+                deleted = frozenset(h)
+                outcome = evaluate_deletion(
+                    payload.plan, tables, deleted, target_raw["data"]
                 )
-            except ApiError as e:
-                # Deleting rows may make an aggregate input empty.
-                scenarios.append(
-                    {
-                        "delete": [label_to_string(l) for l in deleted_sorted],
-                        "target_present": False,
-                        "recompute_error": {
-                            "code": e.code,
-                            "message": e.message,
-                        },
-                    }
-                )
+                scenarios.append(_scenario(deleted, outcome))
 
         body["counterfactual"] = {
             "target": target_presented["row"],
@@ -247,7 +260,7 @@ def execute_query(payload: QueryIn) -> dict[str, Any]:
             "target_provenance": target_presented["provenance"],
             "minimal_deletion_count": len(deletions),
             "minimal_deletion_sets": [
-                [label_to_string(l) for l in sorted(h, key=lambda l: (l[0], tuple(value_sort_key(p) for p in l[1])))]
+                [label_to_string(l) for l in _sorted_labels(h)]
                 for h in deletions
             ],
             "scenarios": scenarios,

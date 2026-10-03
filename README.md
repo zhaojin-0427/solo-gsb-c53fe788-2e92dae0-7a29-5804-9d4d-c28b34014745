@@ -216,8 +216,8 @@ curl -s -X POST http://localhost:8000/query \
 
 * `count(*)` / `count(col)`：覆盖 **所有参与计数的行**（后者忽略 NULL）
   —— 一个合取；
-* `sum(col)`：枚举 **和为目标值的全部极小行组合**（按行而非按值，同值行
-  产生不同组合并完整保留）；
+* `sum(col)`：枚举 **和为目标值的全部极小非空行组合**（按行而非按值，同值行
+  产生不同组合并完整保留；**空组合永远不是见证，即使目标和为 0**）；
 * `min(col)` / `max(col)`：枚举 **仍能产生目标极值的极小组合** —— 每个
   等于极值的行各成一个见证。
 
@@ -349,9 +349,152 @@ curl -s -X POST http://localhost:8000/query \
 
 多见证（DNF 多析取项）在 `sum`/`min`/`max` 出现多种极小组合时产生。例如
 同组金额为 `30, 30, 60, -60` 时 `sum=60` 的极小组合是 `{30,30}` 与 `{60}`，
-溯源为 `(s1 ∧ s2) ∨ (s3)`，最小删除集为 `["orders[1]","orders[3]"]` 和
-`["orders[2]","orders[3]"]`；`min`/`max` 则对每个等于极值的行各给出一个
-单例见证。
+溯源为 `(s1 ∧ s2) ∨ (s3)`。
+
+### 混合正负金额的 `sum`：以删除后重算判定极小删除集
+
+`sum` 对源行 **不是单调的**：同组金额同时含正数与负数时，删一行可能让总和
+离开、甚至重新落回目标值，因此见证的极小命中集只能给出单调近似（会漏报或
+多报）。此时服务改为 **按删除后在快照上完整重算整条计划** 来判定：枚举源行
+删除候选（按基数递增），凡是已经包含某个更小命中方案的超集直接剪枝，最后
+返回全部按包含关系极小、且重算后目标行确实消失的删除集；每个方案都附带
+重算场景。方案与场景均按来源标签全序稳定排序。`count`/`min`/`max` 以及
+同号（全非负或全非正）的 `sum` 仍走命中集路径，语义不变。
+
+#### 请求：金额 `5, 2, -2`，解释组 `cid=10`（`sum=5`）
+
+```bash
+curl -s -X POST http://localhost:8000/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "idempotency_key": "readme-mixed-sum-1",
+  "tables": [
+    {"table": "orders", "primary_key": ["oid"],
+     "columns": [{"name":"oid","type":"int"},{"name":"cid","type":"int"},{"name":"amount","type":"int"}],
+     "rows": [
+       {"oid":1,"cid":10,"amount":5},
+       {"oid":2,"cid":10,"amount":2},
+       {"oid":3,"cid":10,"amount":-2},
+       {"oid":4,"cid":20,"amount":100}
+     ]}
+  ],
+  "plan": {
+    "type": "aggregate",
+    "input": {"type": "scan", "table": "orders"},
+    "group_by": ["cid"],
+    "aggregates": [{"fn":"sum","column":"amount","as":"total"}]
+  },
+  "explain": {"row": {"cid":10,"total":5}}
+}'
+```
+
+实际响应（线上传输为单行紧凑 JSON；这里为可读性格式化）：
+
+```json
+{
+  "status": "ok",
+  "symbol_table": [
+    {"symbol": "s1", "source": "orders[1]"},
+    {"symbol": "s2", "source": "orders[4]"}
+  ],
+  "result": {
+    "columns": ["cid", "total"],
+    "row_count": 2,
+    "rows": [
+      {
+        "row": {"cid": 10, "total": 5},
+        "witness_count": 1,
+        "minimal_witnesses": [
+          {"labels": ["orders[1]"], "symbols": ["s1"], "conjunction": "s1"}
+        ],
+        "provenance": {
+          "dnf": "(s1)",
+          "dnf_structured": [["s1"]],
+          "labels_structured": [["orders[1]"]]
+        }
+      },
+      {
+        "row": {"cid": 20, "total": 100},
+        "witness_count": 1,
+        "minimal_witnesses": [
+          {"labels": ["orders[4]"], "symbols": ["s2"], "conjunction": "s2"}
+        ],
+        "provenance": {
+          "dnf": "(s2)",
+          "dnf_structured": [["s2"]],
+          "labels_structured": [["orders[4]"]]
+        }
+      }
+    ]
+  },
+  "counterfactual": {
+    "target_index": 0,
+    "target": {"cid": 10, "total": 5},
+    "target_provenance": {
+      "dnf": "(s1)",
+      "dnf_structured": [["s1"]],
+      "labels_structured": [["orders[1]"]]
+    },
+    "minimal_deletion_count": 3,
+    "minimal_deletion_sets": [
+      ["orders[1]"],
+      ["orders[2]"],
+      ["orders[3]"]
+    ],
+    "scenarios": [
+      {
+        "delete": ["orders[1]"],
+        "target_present": false,
+        "result": {
+          "columns": ["cid", "total"],
+          "row_count": 2,
+          "rows": [
+            {"cid": 10, "total": 0},
+            {"cid": 20, "total": 100}
+          ]
+        }
+      },
+      {
+        "delete": ["orders[2]"],
+        "target_present": false,
+        "result": {
+          "columns": ["cid", "total"],
+          "row_count": 2,
+          "rows": [
+            {"cid": 10, "total": 3},
+            {"cid": 20, "total": 100}
+          ]
+        }
+      },
+      {
+        "delete": ["orders[3]"],
+        "target_present": false,
+        "result": {
+          "columns": ["cid", "total"],
+          "row_count": 2,
+          "rows": [
+            {"cid": 10, "total": 7},
+            {"cid": 20, "total": 100}
+          ]
+        }
+      }
+    ]
+  }
+}
+```
+
+解读：命中集近似只会给出 `orders[1]`（唯一见证 `s1`），但重算判定补上了
+**单独删除 `orders[2]`（总和变 3）或 `orders[3]`（总和变 7）** 这两个被漏报
+的极小方案；三者都使目标行 `(10,5)` 消失，且互不包含，因此全部返回（按
+标签排序）。目标行的见证仍只有 `s1`：`2 + (-2) = 0` 的组合在见证极小化时
+被 `{5}` 支配，不进入 DNF。
+
+#### 目标和为 0：空组合不再充当见证
+
+同组金额为 `5, -5`、`sum=0` 时，空子集不能被当作见证；极小见证是非空组合
+`orders[1] ∧ orders[2]`，极小删除集为 `["orders[1]"]` 与 `["orders[2]"]`，
+重算后总和分别为 `-5` / `5`，目标行 `{"total": 0}` 均消失。此前空组合会与
+“组存在性”合取后被误极小化，导致反事实误报需要同时删除两行。
 
 ### 幂等重放逐字节一致
 
@@ -395,10 +538,14 @@ cmp a.json b.json && echo "byte-identical"   # byte-identical
   `s1, s2, ...`（按表名、主键全序排序）。
 * 见证集经过包含极小化：投影去列、自连接等造成的冗余派生会被剔除；
   同一标签集合只保留一份，输出按标签全序稳定排序。
-* 选择、等值连接、投影对源行单调；聚合输出的见证把“组存在性”（至少一名
-  成员存活）与每个聚合表达式的数值组件合取：`count` 覆盖所有参与计数的行，
-  `sum`/`min`/`max` 枚举产生目标值的极小行组合。因此“令输出消失的最小
-  删除集”等于该输出全部极小见证的 **极小命中集**（hypergraph transversal）：
-  命中所有见证后，组键或某个聚合值必然改变（对 `sum` 含正负混合值的极端
-  情形，命中集是单调近似；每个删除场景都会 **重算整条计划** 并显式给出
-  `target_present`，以重算结果为准）。
+* 选择、等值连接、投影对源行单调；`count`/`min`/`max`（以及同号 `sum`）
+  聚合输出的见证把“组存在性”（至少一名成员存活）与每个聚合表达式的数值
+  组件合取：`count` 覆盖所有参与计数的行，`sum`/`min`/`max` 枚举产生目标
+  值的极小 **非空** 行组合。这些情形下“令输出消失的最小删除集”等于该输出
+  全部极小见证的 **极小命中集**（hypergraph transversal）。
+* **混合正负值的 `sum` 不单调**（删行可让总和离开或重新落回目标值），命中
+  集只是单调近似。检测到目标组的某列同时含正数与负数时，服务改为枚举源行
+  删除候选并 **重算整条计划**，按重算后目标行是否消失判定，返回全部按包含
+  关系极小的删除集（超集剪枝；方案与场景按来源标签稳定排序）。NULL 行继续
+  忽略、不进入符号表；多组场景下只追踪目标组的来源行；删除使聚合输入为空时
+  场景保持既有的结构化重算错误（`EMPTY_AGGREGATE`）。

@@ -8,12 +8,16 @@ the DNF over all its minimal witnesses::
 
     (s1 ∧ s3) ∨ (s2 ∧ s3)
 
-Because witnesses are inclusion-minimal and the operators are monotone in
-the source rows (select / equi-join / project; aggregates pin their exact
-output value — count covers every counted row, sum/min/max enumerate the
-minimal row combinations producing the target value), the sets of source
-rows whose removal makes an output row disappear are exactly the minimal
-hitting sets of its minimal witnesses.
+Because witnesses are inclusion-minimal and the monotone operators
+(select / equi-join / project), ``count``/``min``/``max`` and same-sign
+``sum`` aggregates pin their exact output value (count covers every counted
+row; sum/min/max enumerate the minimal non-empty row combinations producing
+the target value), the sets of source rows whose removal makes such an output
+row disappear are exactly the minimal hitting sets of its minimal witnesses.
+
+``sum`` over mixed positive and negative values is non-monotone in the
+source rows, so its minimal deletion sets are decided by full recomputation
+instead (see app.counterfactual).
 """
 from __future__ import annotations
 

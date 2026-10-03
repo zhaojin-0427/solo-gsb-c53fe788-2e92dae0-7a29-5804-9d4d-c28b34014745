@@ -171,13 +171,15 @@ def cover_witnesses(rows: Iterable[dict]) -> set[Witness]:
 def minimal_sum_combos(
     items: list[tuple[dict, Any]], target: Any
 ) -> list[tuple[dict, ...]]:
-    """All inclusion-minimal subsets of *items* whose values sum to *target*.
+    """All inclusion-minimal non-empty subsets of *items* whose values sum to *target*.
 
     Rows are matched by identity, so equal-valued rows yield distinct
     combinations. Once a partial selection already sums to the target no
     superset of it can be minimal, and with all values non-negative a partial
     sum above the target can never come back down; both observations prune
     the backtracking.
+    The empty combination is deliberately excluded even when the target is 0:
+    it would witness every zero-sum aggregate from no source rows.
     """
     n = len(items)
     non_negative = all(is_number(v) and v >= 0 for _, v in items)
@@ -187,7 +189,11 @@ def minimal_sum_combos(
     stack: list[tuple[int, Any, tuple[int, ...]]] = [(0, 0, ())]
     while stack:
         i, acc, chosen = stack.pop()
-        if acc == target:
+        if chosen and acc == target:
+            # No superset of a target-summing selection can be minimal; this
+            # also holds with mixed signs (remaining items would have to net
+            # to zero). The root state (empty selection) is skipped so a
+            # target of 0 does not yield the empty combination.
             combos.append(tuple(items[j][0] for j in chosen))
             continue
         if i == n or (non_negative and acc > target):
@@ -609,8 +615,9 @@ class Evaluator:
         * ``count(*)`` / ``count(col)`` covers every row participating in the
           count (all members, resp. all members with a non-NULL value): one
           conjunction over those rows;
-        * ``sum(col)`` enumerates the inclusion-minimal row combinations
-          whose values add up to the target sum;
+        * ``sum(col)`` enumerates the inclusion-minimal **non-empty** row
+          combinations whose values add up to the target sum (the empty
+          combination is never a witness, even for a target sum of 0);
         * ``min(col)`` / ``max(col)`` enumerates the inclusion-minimal
           combinations still yielding the extremum — one per member row equal
           to it (equal-valued rows give distinct combinations).

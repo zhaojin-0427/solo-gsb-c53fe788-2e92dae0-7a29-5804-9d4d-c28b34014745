@@ -186,6 +186,40 @@ def test_aggregate_sum_minimal_combos():
     combos = minimal_sum_combos(items, 70)
     assert {tuple(m["id"] for m in c) for c in combos} == {("a", "b", "c")}
 
+    # Target zero with mixed signs: the empty combination must never be
+    # returned, even when it "sums" to the target.
+    items = [({"id": "a"}, 5), ({"id": "b"}, -5), ({"id": "z"}, 0)]
+    combos = minimal_sum_combos(items, 0)
+    assert {tuple(m["id"] for m in c) for c in combos} == {
+        ("a", "b"),
+        ("z",),
+    }
+    assert minimal_sum_combos(items, 999) == []
+
+
+def test_aggregate_sum_zero_target_witnesses():
+    """A group of 5 and -5 summing to zero is witnessed by the pair."""
+    tables = [
+        {
+            "table": "orders",
+            "primary_key": ["oid"],
+            "columns": ["oid", "amt"],
+            "rows": [
+                {"oid": 1, "amt": 5},
+                {"oid": 2, "amt": -5},
+            ],
+        }
+    ]
+    plan = {
+        "type": "aggregate",
+        "input": {"type": "scan", "table": "orders"},
+        "aggregates": [{"fn": "sum", "column": "amt", "as": "total"}],
+    }
+    ev = make_evaluator(tables)
+    rows = ev.eval(plan)
+    assert rows[0]["data"] == (0,)
+    assert rows[0]["witnesses"] == {frozenset([L("orders", 1), L("orders", 2)])}
+
 
 def test_aggregate_null_components():
     tables = [
